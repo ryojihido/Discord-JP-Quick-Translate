@@ -1,0 +1,100 @@
+.djt-translate-btn {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: rgba(88, 101, 242, 0.15);
+  border: 1px solid rgba(88, 101, 242, 0.4);
+  border-radius: 4px;
+  color: #5865f2;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+  padding: 2px 7px;
+  opacity: 0;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  z-index: 10;
+  white-space: nowrap;
+  line-height: 1.5;
+}
+
+li[id^="chat-messages-"]:hover .djt-translate-btn {
+  opacity: 1;
+}
+
+.djt-translate-btn:hover {
+  background: rgba(88, 101, 242, 0.3);
+}
+
+.djt-translate-btn.djt-translated {
+  color: #3ba55d;
+  border-color: rgba(59, 165, 93, 0.4);
+  background: rgba(59, 165, 93, 0.1);
+  opacity: 1;
+}
+
+.djt-translation-block {
+  margin-top: 4px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.12);
+  border-left: 3px solid #5865f2;
+  border-radius: 0 4px 4px 0;
+  font-size: 0.9em;
+  color: var(--text-muted, #72767d);
+  line-height: 1.5;
+  position: relative;
+}
+
+.djt-translation-text {
+  color: var(--text-normal, #dcddde);
+  font-style: italic;
+}
+
+.djt-provider-badge {
+  display: inline-block;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+  opacity: 0.7;
+}
+
+.djt-provider-badge.djt-deepl {
+  background: rgba(0, 100, 255, 0.15);
+  color: #0064ff;
+}
+
+.djt-provider-badge.djt-google {
+  background: rgba(66, 133, 244, 0.15);
+  color: #4285f4;
+}
+
+.djt-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted, #72767d);
+  font-size: 0.85em;
+}
+
+.djt-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(88, 101, 242, 0.2);
+  border-top-color: #5865f2;
+  border-radius: 50%;
+  animation: djt-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes djt-spin {
+  to { transform: rotate(360deg); }
+}
+
+li[id^="chat-messages-"] {
+  position: relative;
+}
