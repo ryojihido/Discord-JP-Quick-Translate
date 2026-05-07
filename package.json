@@ -1,6 +1,6 @@
 {
   "name": "discord-jp-quick-translate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Chrome Extension to translate Discord messages to Japanese on demand",
   "private": true,
   "type": "module",

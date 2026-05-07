@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Discord JP Quick Translate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Translate Discord messages to Japanese on demand",
   "permissions": ["storage"],
   "host_permissions": [

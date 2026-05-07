@@ -3,10 +3,18 @@
 ![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-4285F4?logo=googlechrome&logoColor=white)
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-green)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow)
-![Tests](https://img.shields.io/badge/Tests-36%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-39%20passing-brightgreen)
 
 Discord のメッセージをワンクリックで日本語に翻訳する Chrome 拡張機能です。
 翻訳ボタンを押したときだけ API を呼び出すため、DeepL の無料枠を節約できます。
+
+## 最新の更新
+
+### v1.0.1
+
+- 返信つきメッセージを翻訳すると、返信先プレビューではなく本メッセージ本文を翻訳するように修正
+- Discord の返信コンテキスト内にある `message-content-*` を翻訳対象から除外
+- 再発防止のため、返信つきメッセージの本文抽出テストを追加
 
 > [!IMPORTANT]
 > この拡張機能は非公式のブラウザ拡張であり、Discord Inc. とは関係ありません。
@@ -143,6 +151,7 @@ npm run coverage  # カバレッジレポート付き
 テスト構成:
 
 - `tests/unit/` — tokenizer・cache・queue のユニットテスト（計 24 件）
+- `tests/unit/messageExtractor.test.ts` — 返信つきメッセージを含む本文抽出テスト（計 3 件）
 - `tests/integration/` — MSW モックを使った API プロバイダーテスト（計 12 件）
 
 ### ビルド
