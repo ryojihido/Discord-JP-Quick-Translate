@@ -1,3 +1,5 @@
+import { getMessageContent } from '../observer/domSelectors'
+
 const IGNORED_SELECTORS = [
   '[class*="embed"]',
   '[class*="reaction"]',
@@ -10,7 +12,7 @@ const IGNORED_SELECTORS = [
 ]
 
 export function extractMessageText(messageEl: Element): string | null {
-  const contentEl = messageEl.querySelector('[id^="message-content-"]')
+  const contentEl = getMessageContent(messageEl)
   if (!contentEl) return null
 
   const clone = contentEl.cloneNode(true) as Element
@@ -24,5 +26,5 @@ export function extractMessageText(messageEl: Element): string | null {
 }
 
 export function extractMessageRawContent(messageEl: Element): Element | null {
-  return messageEl.querySelector('[id^="message-content-"]')
+  return getMessageContent(messageEl)
 }
