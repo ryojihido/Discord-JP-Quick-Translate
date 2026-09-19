@@ -1,40 +1,15 @@
-const GOOGLE_API_URL = 'https://translation.googleapis.com/language/translate/v2'
-
-export interface GoogleTranslateParams {
-  readonly texts: ReadonlyArray<string>
-  readonly targetLang: string
-  readonly apiKey: string
-}
-
-interface GoogleTranslateResponse {
-  readonly data: {
-    readonly translations: ReadonlyArray<{ readonly translatedText: string }>
-  }
-}
-
-export async function translateWithGoogle(params: GoogleTranslateParams): Promise<string[]> {
-  const { texts, targetLang, apiKey } = params
-
+import { AppError, isRecord } from '../../shared/protocol'
+import { validateTexts, type DeepLTranslateParams } from './deeplProvider'
+import { postJson } from './http'
+export async function translateWithGoogle({ texts, targetLang, apiKey, signal }: DeepLTranslateParams): Promise<string[]> {
+  validateTexts(texts)
   if (texts.length === 0) return []
-
-  const url = `${GOOGLE_API_URL}?key=${encodeURIComponent(apiKey)}`
-
-  const body = {
-    q: [...texts],
-    target: targetLang.toLowerCase(),
-    format: 'html',
+  const data = await postJson('https://translation.googleapis.com/language/translate/v2', { 'x-goog-api-key': apiKey },
+    { q: [...texts], target: targetLang.toLowerCase(), format: 'text' }, signal)
+  if (!isRecord(data) || !isRecord(data.data) || !Array.isArray(data.data.translations) ||
+      data.data.translations.length !== texts.length ||
+      !data.data.translations.every(t => isRecord(t) && typeof t.translatedText === 'string' && t.translatedText.trim() && t.translatedText.length <= 32000)) {
+    throw new AppError('Google の翻訳結果の件数または形式が不正です。')
   }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Google Translate API error: ${response.status} ${response.statusText}`)
-  }
-
-  const data = (await response.json()) as GoogleTranslateResponse
-  return data.data.translations.map((t) => t.translatedText)
+  return data.data.translations.map(t => t.translatedText as string)
 }

@@ -1,5 +1,6 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { sendRequest, readSettings, errorMessage } from '../shared/protocol'
 
 const DEEPL_FREE_LIMIT = 500_000
 
@@ -17,29 +18,30 @@ function PopupApp() {
   const [usage, setUsage] = useState<UsageStats | null>(null)
   const [currentProvider, setCurrentProvider] = useState<'deepl' | 'google'>('deepl')
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
 
   useEffect(() => {
-    chrome.storage.sync.get(['enabled', 'preferredProvider'], (result) => {
-      setEnabled(result.enabled !== false)
-      setCurrentProvider((result.preferredProvider as 'deepl' | 'google') ?? 'deepl')
-    })
-
-    chrome.runtime.sendMessage({ type: 'GET_USAGE' }, (response: UsageStats | undefined) => {
-      if (response) setUsage(response)
-      setLoading(false)
-    })
+    void (async () => {
+      try {
+        const settings = readSettings(await chrome.storage.sync.get(['enabled', 'preferredProvider', 'targetLang']))
+        setEnabled(settings.enabled)
+        setCurrentProvider(settings.preferredProvider)
+        setUsage(await sendRequest<UsageStats>({ type: 'GET_USAGE' }))
+      } catch (e) { setError(errorMessage(e)) }
+      finally { setLoading(false) }
+    })()
   }, [])
 
-  function handleToggle() {
-    const next = !enabled
-    setEnabled(next)
-    chrome.storage.sync.set({ enabled: next })
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tabId = tabs[0]?.id
-      if (tabId !== undefined) {
-        chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_EXTENSION', enabled: next })
-      }
-    })
+  async function handleToggle() {
+    setBusy(true)
+    setError('')
+    try {
+      await chrome.storage.sync.set({ enabled: !enabled })
+      setEnabled(!enabled)
+    } catch (e) { setError(errorMessage(e)) }
+    finally { setBusy(false) }
   }
 
   function openOptions() {
@@ -56,6 +58,7 @@ function PopupApp() {
           <input
             type="checkbox"
             checked={enabled}
+            disabled={loading || busy}
             onChange={handleToggle}
             style={styles.checkbox}
           />
@@ -65,12 +68,13 @@ function PopupApp() {
         </label>
       </div>
 
+      {error && <p role="alert" style={{ color: "#ed4245" }}>{error}</p>}
       {loading ? (
         <div style={styles.loadingText}>読み込み中...</div>
-      ) : (
+      ) : usage ? (
         <div style={styles.stats}>
           <div style={styles.statRow}>
-            <span style={styles.statLabel}>DeepL 使用量</span>
+            <span style={styles.statLabel}>DeepL 推定使用量</span>
             <span style={styles.statValue}>
               {formatNumber(usage?.deepl.chars ?? 0)} / {formatNumber(DEEPL_FREE_LIMIT)} 文字
             </span>
@@ -80,14 +84,14 @@ function PopupApp() {
           </div>
 
           <div style={{ ...styles.statRow, marginTop: 8 }}>
-            <span style={styles.statLabel}>Google 使用量</span>
+            <span style={styles.statLabel}>Google 推定使用量</span>
             <span style={styles.statValue}>
               {formatNumber(usage?.google.chars ?? 0)} 文字
             </span>
           </div>
 
           <div style={styles.providerRow}>
-            <span style={styles.statLabel}>現在のプロバイダー</span>
+            <span style={styles.statLabel}>選択中の翻訳先</span>
             <span
               style={{
                 ...styles.badge,
@@ -99,7 +103,8 @@ function PopupApp() {
             </span>
           </div>
         </div>
-      )}
+      ) : null}
+      <p style={styles.statLabel}>この端末の推定使用量です。課金上限ではありません。</p>
 
       <button style={styles.optionsBtn} onClick={openOptions}>
         設定を開く

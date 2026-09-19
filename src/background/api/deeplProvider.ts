@@ -1,65 +1,20 @@
-const DEEPL_API_URL = 'https://api-free.deepl.com/v2/translate'
-const MAX_TEXTS_PER_REQUEST = 50
-
-export class DeepLQuotaError extends Error {
-  constructor() {
-    super('DeepL quota exceeded')
-    this.name = 'DeepLQuotaError'
-  }
-}
-
+import { AppError, isRecord, MAX_BATCH_LENGTH, MAX_ITEMS, MAX_TEXT_LENGTH } from '../../shared/protocol'
+import { postJson } from './http'
 export interface DeepLTranslateParams {
-  readonly texts: ReadonlyArray<string>
-  readonly targetLang: string
-  readonly apiKey: string
+  readonly texts: ReadonlyArray<string>; readonly targetLang: string; readonly apiKey: string; readonly signal?: AbortSignal
 }
-
-export interface TranslationResult {
-  readonly translations: ReadonlyArray<{ readonly text: string }>
+export function validateTexts(texts: ReadonlyArray<string>): void {
+  if (texts.length > MAX_ITEMS || texts.some(t => typeof t !== 'string' || !t.trim() || t.length > MAX_TEXT_LENGTH) ||
+      texts.reduce((n, t) => n + t.length, 0) > MAX_BATCH_LENGTH) throw new AppError('翻訳する文章が長すぎるか、形式が不正です。')
 }
-
-export async function translateWithDeepL(params: DeepLTranslateParams): Promise<string[]> {
-  const { texts, targetLang, apiKey } = params
-
+export async function translateWithDeepL({ texts, targetLang, apiKey, signal }: DeepLTranslateParams): Promise<string[]> {
+  validateTexts(texts)
   if (texts.length === 0) return []
-
-  const batches = chunkArray([...texts], MAX_TEXTS_PER_REQUEST)
-  const results: string[] = []
-
-  for (const batch of batches) {
-    const body = new URLSearchParams()
-    batch.forEach((text) => body.append('text', text))
-    body.set('target_lang', targetLang.toUpperCase())
-    body.set('tag_handling', 'xml')
-
-    const response = await fetch(DEEPL_API_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `DeepL-Auth-Key ${apiKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: body.toString(),
-    })
-
-    if (response.status === 456) {
-      throw new DeepLQuotaError()
-    }
-
-    if (!response.ok) {
-      throw new Error(`DeepL API error: ${response.status} ${response.statusText}`)
-    }
-
-    const data = (await response.json()) as TranslationResult
-    data.translations.forEach((t) => results.push(t.text))
+  const data = await postJson('https://api-free.deepl.com/v2/translate', { Authorization: 'DeepL-Auth-Key ' + apiKey },
+    { text: [...texts], target_lang: targetLang.toUpperCase() }, signal)
+  if (!isRecord(data) || !Array.isArray(data.translations) || data.translations.length !== texts.length ||
+      !data.translations.every(t => isRecord(t) && typeof t.text === 'string' && t.text.trim() && t.text.length <= 32000)) {
+    throw new AppError('DeepL の翻訳結果の件数または形式が不正です。')
   }
-
-  return results
-}
-
-function chunkArray<T>(arr: T[], size: number): T[][] {
-  const chunks: T[][] = []
-  for (let i = 0; i < arr.length; i += size) {
-    chunks.push(arr.slice(i, i + size))
-  }
-  return chunks
+  return data.translations.map(t => t.text as string)
 }

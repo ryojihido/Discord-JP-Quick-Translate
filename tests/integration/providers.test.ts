@@ -1,200 +1,77 @@
-import { describe, expect, it, beforeAll, afterAll, afterEach } from 'vitest'
-import { http, HttpResponse } from 'msw'
-import { setupServer } from 'msw/node'
-import { translateWithDeepL, DeepLQuotaError } from '../../src/background/api/deeplProvider'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { translateWithDeepL } from '../../src/background/api/deeplProvider'
 import { translateWithGoogle } from '../../src/background/api/googleProvider'
-import { routeTranslation, resetRouterState } from '../../src/background/api/providerRouter'
-
-const DEEPL_URL = 'https://api-free.deepl.com/v2/translate'
-const GOOGLE_URL = 'https://translation.googleapis.com/language/translate/v2'
-
-const server = setupServer()
-
-beforeAll(() => server.listen({ onUnhandledRequest: 'error' }))
-afterEach(() => {
-  server.resetHandlers()
-  resetRouterState()
-})
-afterAll(() => server.close())
-
-describe('DeepL provider', () => {
-  it('returns translated texts on success', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () =>
-        HttpResponse.json({
-          translations: [{ text: 'こんにちは' }, { text: '世界' }],
-        }),
-      ),
-    )
-
-    // Act
-    const result = await translateWithDeepL({
-      texts: ['Hello', 'World'],
-      targetLang: 'JA',
-      apiKey: 'test-key',
-    })
-
-    // Assert
-    expect(result).toEqual(['こんにちは', '世界'])
+import { routeTranslation } from '../../src/background/api/providerRouter'
+import { API_TIMEOUT_MS } from '../../src/background/api/http'
+afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers() })
+describe('provider HTTP boundaries (isolated, no external requests)', () => {
+  it('sends DeepL plain text with header authentication, no HTML interpretation', async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ translations: [{ text: '訳' }] })))
+    vi.stubGlobal('fetch', fetch)
+    expect(await translateWithDeepL({ texts: ['<x>& hello'], targetLang: 'ja', apiKey: 'dummy-key' })).toEqual(['訳'])
+    const [url, init] = fetch.mock.calls[0] as any
+    expect(url).toBe('https://api-free.deepl.com/v2/translate')
+    expect(init.headers.Authorization).toBe('DeepL-Auth-Key dummy-key')
+    expect(JSON.parse(init.body)).toEqual({ text: ['<x>& hello'], target_lang: 'JA' })
+    expect(init.redirect).toBe('error')
   })
-
-  it('throws DeepLQuotaError when status 456 is returned', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () =>
-        new HttpResponse(null, { status: 456, statusText: 'Quota Exceeded' }),
-      ),
-    )
-
-    // Act & Assert
-    await expect(
-      translateWithDeepL({ texts: ['Test'], targetLang: 'JA', apiKey: 'test-key' }),
-    ).rejects.toThrow(DeepLQuotaError)
+  it('keeps Google keys out of the URL and uses plain-text format', async () => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ data: { translations: [{ translatedText: '<訳>' }] } })))
+    vi.stubGlobal('fetch', fetch)
+    expect(await translateWithGoogle({ texts: ['hello'], targetLang: 'JA', apiKey: 'dummy-key' })).toEqual(['<訳>'])
+    const [url, init] = fetch.mock.calls[0] as any
+    expect(url).not.toContain('?')
+    expect(init.headers['x-goog-api-key']).toBe('dummy-key')
+    expect(JSON.parse(init.body).format).toBe('text')
   })
-
-  it('throws a generic error for non-456 HTTP failures', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () =>
-        new HttpResponse(null, { status: 401, statusText: 'Unauthorized' }),
-      ),
-    )
-
-    // Act & Assert
-    await expect(
-      translateWithDeepL({ texts: ['Test'], targetLang: 'JA', apiKey: 'bad-key' }),
-    ).rejects.toThrow('DeepL API error: 401')
+  it.each([401,403,429,456,500])('fails explicitly on HTTP %i without contacting another provider', async status => {
+    const fetch = vi.fn(async () => new Response('', { status }))
+    vi.stubGlobal('fetch', fetch)
+    await expect(routeTranslation(['hi'], 'JA', 'deepl', 'dummy', 'dummy')).rejects.toThrow()
+    expect(fetch).toHaveBeenCalledOnce()
+    expect(fetch.mock.calls[0][0]).toContain('deepl')
   })
-
-  it('returns empty array when given empty texts array', async () => {
-    // Arrange (no HTTP mock needed — returns early)
-
-    // Act
-    const result = await translateWithDeepL({ texts: [], targetLang: 'JA', apiKey: 'key' })
-
-    // Assert
-    expect(result).toEqual([])
+  it('never substitutes another provider when the selected key is missing', async () => {
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    await expect(routeTranslation(['hi'], 'JA', 'deepl', null, 'dummy')).rejects.toThrow('キー')
+    await expect(routeTranslation(['hi'], 'JA', 'bad' as any, 'dummy', 'dummy')).rejects.toThrow()
+    expect(fetch).not.toHaveBeenCalled()
   })
-})
-
-describe('Google provider', () => {
-  it('returns translated texts on success', async () => {
-    // Arrange
-    server.use(
-      http.post(GOOGLE_URL, () =>
-        HttpResponse.json({
-          data: {
-            translations: [{ translatedText: 'こんにちは' }],
-          },
-        }),
-      ),
-    )
-
-    // Act
-    const result = await translateWithGoogle({
-      texts: ['Hello'],
-      targetLang: 'ja',
-      apiKey: 'test-key',
-    })
-
-    // Assert
-    expect(result).toEqual(['こんにちは'])
+  it.each([{}, { translations: [] }, { translations: [{ text: '' }] }, { translations: [{ text: 1 }] }])('rejects malformed DeepL response %j', async body => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body))))
+    await expect(translateWithDeepL({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy' })).rejects.toThrow('形式')
   })
-
-  it('throws an error when the API returns a non-200 status', async () => {
-    // Arrange
-    server.use(
-      http.post(GOOGLE_URL, () =>
-        new HttpResponse(null, { status: 403, statusText: 'Forbidden' }),
-      ),
-    )
-
-    // Act & Assert
-    await expect(
-      translateWithGoogle({ texts: ['Test'], targetLang: 'ja', apiKey: 'bad-key' }),
-    ).rejects.toThrow('Google Translate API error: 403')
+  it.each([{}, { data: {} }, { data: { translations: [] } }, { data: { translations: [{ translatedText: '' }] } }])('rejects malformed Google response %j', async body => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body))))
+    await expect(translateWithGoogle({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy' })).rejects.toThrow('形式')
   })
-
-  it('returns empty array when given empty texts array', async () => {
-    // Arrange (no HTTP mock needed)
-
-    // Act
-    const result = await translateWithGoogle({ texts: [], targetLang: 'ja', apiKey: 'key' })
-
-    // Assert
-    expect(result).toEqual([])
+  it('validates oversized requests before HTTP and handles empty requests', async () => {
+    const fetch = vi.fn(); vi.stubGlobal('fetch', fetch)
+    for (const translate of [translateWithDeepL, translateWithGoogle]) {
+      expect(await translate({ texts: [], targetLang: 'JA', apiKey: 'dummy' })).toEqual([])
+      await expect(translate({ texts: ['x'.repeat(8001)], targetLang: 'JA', apiKey: 'dummy' })).rejects.toThrow()
+    }
+    expect(fetch).not.toHaveBeenCalled()
   })
-})
-
-describe('providerRouter', () => {
-  it('routes to DeepL when it is the preferred provider and key is available', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () =>
-        HttpResponse.json({ translations: [{ text: '成功' }] }),
-      ),
-    )
-
-    // Act
-    const result = await routeTranslation(['success'], 'JA', 'deepl', 'deepl-key', 'google-key')
-
-    // Assert
-    expect(result.provider).toBe('deepl')
-    expect(result.translations).toEqual(['成功'])
+  it('aborts timed-out and externally-cancelled requests', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', vi.fn((_url, init) => new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new DOMException('aborted','AbortError')))
+    })))
+    const request = translateWithDeepL({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy' })
+    const assertion = expect(request).rejects.toThrow('タイムアウト')
+    await vi.advanceTimersByTimeAsync(API_TIMEOUT_MS)
+    await assertion
+    const controller = new AbortController()
+    const next = translateWithGoogle({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy', signal: controller.signal })
+    controller.abort()
+    await expect(next).rejects.toThrow('中止')
   })
-
-  it('falls back to Google when DeepL returns quota exceeded (456)', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () => new HttpResponse(null, { status: 456 })),
-      http.post(GOOGLE_URL, () =>
-        HttpResponse.json({ data: { translations: [{ translatedText: 'フォールバック' }] } }),
-      ),
-    )
-
-    // Act
-    const result = await routeTranslation(['fallback'], 'JA', 'deepl', 'deepl-key', 'google-key')
-
-    // Assert
-    expect(result.provider).toBe('google')
-    expect(result.translations).toEqual(['フォールバック'])
-  })
-
-  it('throws an error when DeepL quota is exceeded and no Google key is provided', async () => {
-    // Arrange
-    server.use(
-      http.post(DEEPL_URL, () => new HttpResponse(null, { status: 456 })),
-    )
-
-    // Act & Assert
-    await expect(
-      routeTranslation(['test'], 'JA', 'deepl', 'deepl-key', null),
-    ).rejects.toThrow('No translation API keys configured')
-  })
-
-  it('routes directly to Google when preferred provider is google', async () => {
-    // Arrange
-    server.use(
-      http.post(GOOGLE_URL, () =>
-        HttpResponse.json({ data: { translations: [{ translatedText: 'グーグル経由' }] } }),
-      ),
-    )
-
-    // Act
-    const result = await routeTranslation(['via google'], 'JA', 'google', 'deepl-key', 'google-key')
-
-    // Assert
-    expect(result.provider).toBe('google')
-    expect(result.translations).toEqual(['グーグル経由'])
-  })
-
-  it('throws when no keys are configured at all', async () => {
-    // Arrange (no mocks needed)
-
-    // Act & Assert
-    await expect(
-      routeTranslation(['test'], 'JA', 'deepl', null, null),
-    ).rejects.toThrow('No translation API keys configured')
+  it('does not expose provider error bodies or fetch errors containing credentials', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('secret-value') }))
+    await expect(translateWithDeepL({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy' })).rejects.toThrow('通信')
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('not json secret-value')))
+    await expect(translateWithGoogle({ texts: ['hi'], targetLang: 'JA', apiKey: 'dummy' })).rejects.not.toThrow('secret-value')
   })
 })

@@ -1,74 +1,12 @@
-import { translateWithDeepL, DeepLQuotaError } from './deeplProvider'
+import { translateWithDeepL } from './deeplProvider'
 import { translateWithGoogle } from './googleProvider'
-
-export type ProviderName = 'deepl' | 'google'
-
-export interface RouteResult {
-  readonly translations: string[]
-  readonly provider: ProviderName
-}
-
-interface RouterState {
-  readonly deeplExhaustedMonth: number | null
-}
-
-let state: RouterState = { deeplExhaustedMonth: null }
-
-function isDeepLExhausted(): boolean {
-  if (state.deeplExhaustedMonth === null) return false
-  const exhaustedMonth = state.deeplExhaustedMonth
-  const currentMonth = getCurrentMonthKey()
-  return exhaustedMonth === currentMonth
-}
-
-function getCurrentMonthKey(): number {
-  const now = new Date()
-  return now.getFullYear() * 100 + (now.getMonth() + 1)
-}
-
-function markDeepLExhausted(): void {
-  state = { ...state, deeplExhaustedMonth: getCurrentMonthKey() }
-}
-
-export async function routeTranslation(
-  texts: ReadonlyArray<string>,
-  targetLang: string,
-  preferredProvider: ProviderName,
-  deeplKey: string | null,
-  googleKey: string | null,
-): Promise<RouteResult> {
-  const shouldUseDeepL = preferredProvider === 'deepl' && deeplKey && !isDeepLExhausted()
-
-  if (shouldUseDeepL && deeplKey) {
-    try {
-      const translations = await translateWithDeepL({
-        texts,
-        targetLang,
-        apiKey: deeplKey,
-      })
-      return { translations, provider: 'deepl' }
-    } catch (error) {
-      if (error instanceof DeepLQuotaError) {
-        markDeepLExhausted()
-      } else {
-        throw error
-      }
-    }
-  }
-
-  if (!googleKey) {
-    throw new Error('No translation API keys configured. Please add an API key in the options.')
-  }
-
-  const translations = await translateWithGoogle({
-    texts,
-    targetLang,
-    apiKey: googleKey,
-  })
-
-  return { translations, provider: 'google' }
-}
-
-export function resetRouterState(): void {
-  state = { deeplExhaustedMonth: null }
+import { AppError, isProvider, type ProviderName } from '../../shared/protocol'
+export type { ProviderName } from '../../shared/protocol'
+export async function routeTranslation(texts: ReadonlyArray<string>, targetLang: string, provider: ProviderName,
+  deeplKey: string | null, googleKey: string | null, signal?: AbortSignal) {
+  if (!isProvider(provider)) throw new AppError('翻訳先の設定が不正です。')
+  const key = provider === 'deepl' ? deeplKey : googleKey
+  if (!key) throw new AppError('選択した翻訳先の API キーを設定してください。')
+  const translate = provider === 'deepl' ? translateWithDeepL : translateWithGoogle
+  return { translations: await translate({ texts, targetLang, apiKey: key, signal }), provider }
 }

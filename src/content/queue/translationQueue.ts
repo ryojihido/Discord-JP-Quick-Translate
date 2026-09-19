@@ -1,82 +1,59 @@
+import { AppError, isRecord, isProvider, sendRequest, validateItems, MAX_ITEMS, MAX_BATCH_LENGTH } from '../../shared/protocol'
+export interface TranslationResult { readonly translation: string; readonly provider: string }
 export interface QueueItem {
-  readonly id: string
-  readonly text: string
-  readonly isInViewport: boolean
-  readonly resolve: (result: TranslationResult) => void
-  readonly reject: (error: Error) => void
+  readonly id: string; readonly text: string; readonly isInViewport: boolean
+  readonly resolve: (result: TranslationResult) => void; readonly reject: (error: Error) => void
 }
-
-export interface TranslationResult {
-  readonly translation: string
-  readonly provider: string
-}
-
-interface BatchMessage {
-  readonly type: 'TRANSLATE_BATCH'
-  readonly items: ReadonlyArray<{ readonly id: string; readonly text: string }>
-}
-
-interface BatchResult {
-  readonly results: ReadonlyArray<{
-    readonly id: string
-    readonly translation: string
-    readonly provider: string
-  }>
-}
-
-const DEBOUNCE_MS = 250
-
 export class TranslationQueue {
   private pending: QueueItem[] = []
+  private inFlight: QueueItem[] = []
   private timer: ReturnType<typeof setTimeout> | null = null
-
+  private generation = 0
   enqueue(item: QueueItem): void {
-    this.pending = [...this.pending, item]
-
-    if (this.timer !== null) {
-      clearTimeout(this.timer)
-    }
-
-    this.timer = setTimeout(() => {
-      this.flush()
-    }, DEBOUNCE_MS)
+    try { validateItems([{ id: item.id, text: item.text }]) }
+    catch (error) { item.reject(error as Error); return }
+    if (this.pending.length >= 100) { item.reject(new AppError('翻訳待ちが多すぎます。')); return }
+    this.pending.push(item)
+    this.schedule()
   }
-
-  private flush(): void {
-    const batch = this.pending
-    this.pending = []
+  cancel(): void {
+    this.generation++
+    if (this.timer !== null) clearTimeout(this.timer)
     this.timer = null
-
-    if (batch.length === 0) return
-
-    const sorted = [...batch].sort((a, b) => {
-      if (a.isInViewport && !b.isInViewport) return -1
-      if (!a.isInViewport && b.isInViewport) return 1
-      return 0
-    })
-
-    const message: BatchMessage = {
-      type: 'TRANSLATE_BATCH',
-      items: sorted.map(({ id, text }) => ({ id, text })),
+    const error = new AppError('翻訳を中止しました。')
+    for (const item of [...this.pending, ...this.inFlight]) item.reject(error)
+    this.pending = []
+    // An already-sent request keeps the slot until its callback/timeout settles.
+  }
+  private schedule(): void {
+    if (this.timer !== null || this.inFlight.length || !this.pending.length) return
+    this.timer = setTimeout(() => { this.timer = null; void this.flush() }, 250)
+  }
+  private async flush(): Promise<void> {
+    this.pending.sort((a, b) => Number(b.isInViewport) - Number(a.isInViewport))
+    const batch: QueueItem[] = []
+    let length = 0
+    while (this.pending.length && batch.length < MAX_ITEMS && length + this.pending[0].text.length <= MAX_BATCH_LENGTH) {
+      const item = this.pending.shift()!
+      length += item.text.length
+      batch.push(item)
     }
-
-    chrome.runtime.sendMessage(message, (response: BatchResult | undefined) => {
-      if (chrome.runtime.lastError || !response) {
-        const error = new Error(chrome.runtime.lastError?.message ?? 'Translation batch failed')
-        sorted.forEach((item) => item.reject(error))
-        return
+    this.inFlight = batch
+    const generation = this.generation
+    try {
+      const data = await sendRequest<unknown>({ type: 'TRANSLATE_BATCH', items: batch.map(({ id, text }) => ({ id, text })) })
+      if (generation !== this.generation) return
+      if (!isRecord(data) || !Array.isArray(data.results) || data.results.length !== batch.length) throw new AppError('翻訳結果の件数が不正です。')
+      const resultMap = new Map<string, TranslationResult>()
+      for (const result of data.results) {
+        if (!isRecord(result) || typeof result.id !== 'string' || typeof result.translation !== 'string' ||
+            !result.translation.trim() || !isProvider(result.provider) || resultMap.has(result.id)) throw new AppError('翻訳結果の形式が不正です。')
+        resultMap.set(result.id, { translation: result.translation, provider: result.provider })
       }
-
-      const resultMap = new Map(response.results.map((r) => [r.id, r]))
-
-      sorted.forEach((item) => {
-        const result = resultMap.get(item.id)
-        if (result !== undefined) {
-          item.resolve({ translation: result.translation, provider: result.provider })
-        } else {
-          item.reject(new Error(`No translation returned for message ${item.id}`))
-        }
-      })
-    })
+      if (batch.some(item => !resultMap.has(item.id))) throw new AppError('翻訳結果の対応が不正です。')
+      for (const item of batch) item.resolve(resultMap.get(item.id)!)
+    } catch (error) {
+      if (generation === this.generation) for (const item of batch) item.reject(error as Error)
+    } finally { this.inFlight = []; this.schedule() }
   }
 }

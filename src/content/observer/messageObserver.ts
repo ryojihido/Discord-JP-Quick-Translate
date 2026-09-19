@@ -11,10 +11,14 @@ export class MessageObserver {
   }
 
   start(): void {
+    if (this.observer) return
     this.processExistingMessages()
 
     this.observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
+        const target = mutation.target instanceof Element ? mutation.target : mutation.target.parentElement
+        const message = target?.closest(SELECTORS.messageItem)
+        if (message) this.callback(message)
         for (const node of mutation.addedNodes) {
           if (!(node instanceof Element)) continue
           this.processNode(node)

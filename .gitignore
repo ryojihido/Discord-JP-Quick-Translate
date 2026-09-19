@@ -5,6 +5,7 @@ releases/
 # Dependencies
 node_modules/
 .npm-cache/
+coverage/
 
 # Logs
 *.log

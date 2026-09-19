@@ -1,164 +1,88 @@
-const DB_NAME = 'djt-cache'
-const DB_VERSION = 1
-const STORE_NAME = 'translations'
-const TTL_MS = 30 * 24 * 60 * 60 * 1000
-
-export interface CacheEntry {
-  readonly key: string
-  readonly translation: string
-  readonly timestamp: number
-  readonly provider: string
-}
-
+import { AppError } from '../../shared/protocol'
+export const TTL_MS = 30 * 24 * 60 * 60 * 1000
+const STORE = 'translations'
+export interface CacheEntry { readonly key: string; readonly translation: string; readonly timestamp: number; readonly provider: string }
 export class TranslationCache {
   private db: IDBDatabase | null = null
-  private readonly memoryCache = new Map<string, CacheEntry>()
-
-  async open(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(DB_NAME, DB_VERSION)
-
-      request.onupgradeneeded = (event) => {
-        const db = (event.target as IDBOpenDBRequest).result
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' })
-          store.createIndex('timestamp', 'timestamp')
-        }
+  private opening: Promise<void> | null = null
+  open(): Promise<void> {
+    if (this.opening) return this.opening
+    this.opening = new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open('djt-cache', 1)
+      let blocked = false
+      request.onupgradeneeded = () => {
+        const store = request.result.createObjectStore(STORE, { keyPath: 'key' })
+        store.createIndex('timestamp', 'timestamp')
       }
-
-      request.onsuccess = (event) => {
-        this.db = (event.target as IDBOpenDBRequest).result
+      request.onsuccess = () => {
+        if (blocked) { request.result.close(); return }
+        this.db = request.result
+        this.db.onversionchange = () => { this.db?.close(); this.db = null }
         resolve()
       }
-
-      request.onerror = () => reject(request.error)
+      request.onerror = () => reject(new AppError('キャッシュを開けません。'))
+      request.onblocked = () => { blocked = true; reject(new AppError('キャッシュが別の画面で使用中です。拡張機能を再読み込みしてください。')) }
+    })
+    return this.opening
+  }
+  private transaction(mode: IDBTransactionMode): IDBTransaction {
+    if (!this.db) throw new AppError('キャッシュが準備されていません。')
+    return this.db.transaction(STORE, mode)
+  }
+  private complete(tx: IDBTransaction): Promise<void> {
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve()
+      tx.onabort = () => reject(new AppError('キャッシュの保存・読取りに失敗しました。'))
+      tx.onerror = () => reject(new AppError('キャッシュの保存・読取りに失敗しました。'))
     })
   }
-
   async get(key: string): Promise<CacheEntry | null> {
-    const memHit = this.memoryCache.get(key)
-    if (memHit) {
-      if (Date.now() - memHit.timestamp > TTL_MS) {
-        this.memoryCache.delete(key)
-        return null
-      }
-      return memHit
+    const tx = this.transaction('readwrite')
+    const done = this.complete(tx)
+    const request = tx.objectStore(STORE).get(key)
+    let entry: CacheEntry | null = null
+    request.onsuccess = () => {
+      const stored = request.result as CacheEntry | undefined
+      if (stored && stored.timestamp > Date.now() - TTL_MS) entry = stored
+      else if (stored) tx.objectStore(STORE).delete(key)
     }
-
-    if (!this.db) return null
-
-    return new Promise((resolve, reject) => {
-      const tx = this.db!.transaction(STORE_NAME, 'readonly')
-      const store = tx.objectStore(STORE_NAME)
-      const request = store.get(key)
-
-      request.onsuccess = () => {
-        const entry = request.result as CacheEntry | undefined
-        if (!entry) {
-          resolve(null)
-          return
-        }
-
-        if (Date.now() - entry.timestamp > TTL_MS) {
-          resolve(null)
-          return
-        }
-
-        this.memoryCache.set(key, entry)
-        resolve(entry)
-      }
-
-      request.onerror = () => reject(request.error)
-    })
+    await done
+    return entry
   }
-
   async set(entry: CacheEntry): Promise<void> {
-    this.memoryCache.set(entry.key, entry)
-
-    if (!this.db) return
-
-    return new Promise((resolve, reject) => {
-      const tx = this.db!.transaction(STORE_NAME, 'readwrite')
-      const store = tx.objectStore(STORE_NAME)
-      const request = store.put(entry)
-
-      request.onsuccess = () => resolve()
-      request.onerror = () => reject(request.error)
-    })
+    const tx = this.transaction('readwrite')
+    const done = this.complete(tx)
+    tx.objectStore(STORE).put(entry)
+    await done
   }
-
   async prune(): Promise<number> {
-    const cutoff = Date.now() - TTL_MS
-
-    for (const [key, entry] of this.memoryCache.entries()) {
-      if (entry.timestamp < cutoff) {
-        this.memoryCache.delete(key)
-      }
+    const tx = this.transaction('readwrite')
+    const done = this.complete(tx)
+    const request = tx.objectStore(STORE).index('timestamp').openCursor(IDBKeyRange.upperBound(Date.now() - TTL_MS))
+    let count = 0
+    request.onsuccess = () => {
+      const cursor = request.result
+      if (cursor) { cursor.delete(); count++; cursor.continue() }
     }
-
-    if (!this.db) return 0
-
-    return new Promise((resolve, reject) => {
-      const tx = this.db!.transaction(STORE_NAME, 'readwrite')
-      const store = tx.objectStore(STORE_NAME)
-      const index = store.index('timestamp')
-      const range = IDBKeyRange.upperBound(cutoff)
-      const request = index.openCursor(range)
-      let count = 0
-
-      request.onsuccess = (event) => {
-        const cursor = (event.target as IDBRequest<IDBCursorWithValue | null>).result
-        if (!cursor) {
-          resolve(count)
-          return
-        }
-        cursor.delete()
-        count++
-        cursor.continue()
-      }
-
-      request.onerror = () => reject(request.error)
-    })
+    await done
+    return count
   }
-
   async count(): Promise<number> {
-    if (!this.db) return this.memoryCache.size
-
-    return new Promise((resolve, reject) => {
-      const tx = this.db!.transaction(STORE_NAME, 'readonly')
-      const store = tx.objectStore(STORE_NAME)
-      const request = store.count()
-
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
+    const tx = this.transaction('readonly')
+    const done = this.complete(tx)
+    const request = tx.objectStore(STORE).count()
+    await done
+    return request.result
   }
-
   async clear(): Promise<void> {
-    this.memoryCache.clear()
-
-    if (!this.db) return
-
-    return new Promise((resolve, reject) => {
-      const tx = this.db!.transaction(STORE_NAME, 'readwrite')
-      const store = tx.objectStore(STORE_NAME)
-      const request = store.clear()
-
-      request.onsuccess = () => resolve()
-      request.onerror = () => reject(request.error)
-    })
+    const tx = this.transaction('readwrite')
+    const done = this.complete(tx)
+    tx.objectStore(STORE).clear()
+    await done
   }
 }
-
-export async function buildCacheKey(
-  text: string,
-  targetLang: string,
-  provider: string,
-): Promise<string> {
-  const raw = `${text}|${targetLang}|${provider}`
-  const encoded = new TextEncoder().encode(raw)
-  const buffer = await crypto.subtle.digest('SHA-256', encoded)
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
+export async function buildCacheKey(text: string, targetLang: string, provider: string): Promise<string> {
+  // Versioned namespace does not reuse legacy HTML-placeholder cache entries.
+  const buffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(['plain-v2', text, targetLang, provider])))
+  return Array.from(new Uint8Array(buffer), b => b.toString(16).padStart(2, '0')).join('')
 }

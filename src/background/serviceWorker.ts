@@ -1,196 +1,126 @@
-import { routeTranslation, type ProviderName } from './api/providerRouter'
+import { routeTranslation } from './api/providerRouter'
 import { TranslationCache, buildCacheKey } from './cache/translationCache'
 import { trackUsage, getUsageStats } from './usage/usageTracker'
-import { tokenize } from '../content/extractor/tokenizer'
+import { AppError, isRecord, isProvider, errorMessage, readSettings, validateItems, type BatchItem } from '../shared/protocol'
 
 const cache = new TranslationCache()
-
-cache.open().catch((err) => {
-  console.error('[DJT] Failed to open cache DB:', err)
+const ready = (async () => {
+  await chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+  await cache.open()
+  await cache.prune()
+})()
+// Initialization remains rejected; every request below awaits it and fails closed.
+void ready.catch(() => console.error('[DJT] Initialization failed. Requests are disabled.'))
+const active = new Set<AbortController>()
+let epoch = 0
+function invalidate(): void {
+  epoch++
+  for (const controller of active) controller.abort()
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync' && ['enabled', 'targetLang', 'preferredProvider', 'cacheRevision', 'settingsRevision'].some(k => k in changes)) invalidate()
 })
-
-interface TranslateSingleMessage {
-  readonly type: 'TRANSLATE_SINGLE'
-  readonly text: string
-  readonly targetLang: string
-}
-
-interface TranslateBatchMessage {
-  readonly type: 'TRANSLATE_BATCH'
-  readonly items: ReadonlyArray<{ readonly id: string; readonly text: string }>
-}
-
-interface TranslationResponseItem {
-  readonly id: string
-  readonly translation: string
-  readonly provider: ProviderName
-}
-
-interface GetUsageMessage {
-  readonly type: 'GET_USAGE'
-}
-
-interface SetApiKeyMessage {
-  readonly type: 'SET_API_KEY'
-  readonly provider: 'deepl' | 'google'
-  readonly key: string
-}
-
-interface GetApiKeyMessage {
-  readonly type: 'GET_API_KEY'
-  readonly provider: 'deepl' | 'google'
-}
-
-interface ClearCacheMessage {
-  readonly type: 'CLEAR_CACHE'
-}
-
-type IncomingMessage =
-  | TranslateSingleMessage
-  | TranslateBatchMessage
-  | GetUsageMessage
-  | SetApiKeyMessage
-  | GetApiKeyMessage
-  | ClearCacheMessage
-
-async function getStoredKeys(): Promise<{
-  deeplKey: string | null
-  googleKey: string | null
-  targetLang: string
-  preferredProvider: ProviderName
-}> {
-  const settings = await new Promise<Record<string, unknown>>((resolve) => {
-    chrome.storage.sync.get(['targetLang', 'preferredProvider'], resolve)
-  })
-
-  const keys = await new Promise<Record<string, unknown>>((resolve) => {
-    chrome.storage.local.get(['deeplKey', 'googleKey'], resolve)
-  })
-
-  return {
-    deeplKey: (keys.deeplKey as string | undefined) || null,
-    googleKey: (keys.googleKey as string | undefined) || null,
-    targetLang: (settings.targetLang as string | undefined) ?? 'JA',
-    preferredProvider: ((settings.preferredProvider as string | undefined) ?? 'deepl') as ProviderName,
+function authorize(message: Record<string, unknown>, sender: chrome.runtime.MessageSender): void {
+  if (sender.id !== chrome.runtime.id) throw new AppError('送信元を確認できません。')
+  const options = sender.url === chrome.runtime.getURL('src/options/options.html')
+  const popup = sender.url === chrome.runtime.getURL('src/popup/popup.html')
+  if (message.type === 'TRANSLATE_BATCH') {
+    if (sender.frameId !== 0 || typeof sender.tab?.id !== 'number' || !sender.url ||
+        !/^https:\/\/discord\.com\/channels\//.test(sender.url)) throw new AppError('翻訳要求の送信元が不正です。')
+    validateItems(message.items)
+  } else if (message.type === 'GET_USAGE') {
+    if (!options && !popup) throw new AppError('この画面からは使用量を取得できません。')
+  } else if (!options) {
+    throw new AppError('設定ページから操作してください。')
   }
 }
-
-async function translateTexts(
-  texts: string[],
-): Promise<{ translations: string[]; provider: ProviderName }> {
-  const { deeplKey, googleKey, targetLang, preferredProvider } = await getStoredKeys()
-
-  const result = await routeTranslation(texts, targetLang, preferredProvider, deeplKey, googleKey)
-
-  const totalChars = texts.reduce((sum, t) => sum + t.length, 0)
-  await trackUsage(result.provider, totalChars)
-
-  return result
+function validKey(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 512 || /[\r\n]/.test(value)) throw new AppError('API キーの形式が不正です。')
+  return value.trim()
 }
-
-chrome.runtime.onMessage.addListener(
-  (message: IncomingMessage, _sender, sendResponse: (response: unknown) => void) => {
-    handleMessage(message)
-      .then(sendResponse)
-      .catch((err) => {
-        console.error('[DJT] Message handler error:', err)
-        sendResponse({ error: (err as Error).message })
-      })
-    return true
-  },
-)
-
-async function handleMessage(message: IncomingMessage): Promise<unknown> {
+async function translate(items: BatchItem[]) {
+  const requestEpoch = epoch
+  const controller = new AbortController()
+  if (active.size >= 2) throw new AppError('翻訳要求が集中しています。少し待ってから再度操作してください。')
+  active.add(controller)
+  const check = () => { if (requestEpoch !== epoch || controller.signal.aborted) throw new AppError('設定変更またはキャッシュ削除により翻訳を中止しました。') }
+  try {
+    const settings = readSettings(await chrome.storage.sync.get(['enabled', 'targetLang', 'preferredProvider']))
+    if (!settings.enabled) throw new AppError('翻訳機能はオフです。')
+    await cache.prune()
+    check()
+    const results = []
+    const missing = []
+    for (const item of items) {
+      const key = await buildCacheKey(item.text, settings.targetLang, settings.preferredProvider)
+      const hit = await cache.get(key)
+      if (hit) results.push({ id: item.id, translation: hit.translation, provider: hit.provider })
+      else missing.push({ ...item, key })
+    }
+    if (missing.length) {
+      const keys = await chrome.storage.local.get(['deeplKey', 'googleKey'])
+      check()
+      const { translations, provider } = await routeTranslation(missing.map(i => i.text), settings.targetLang,
+        settings.preferredProvider, typeof keys.deeplKey === 'string' ? keys.deeplKey : null,
+        typeof keys.googleKey === 'string' ? keys.googleKey : null, controller.signal)
+      // Count successful API responses even when a later settings change discards the display.
+      await trackUsage(provider, missing.reduce((sum, i) => sum + Array.from(i.text).length, 0))
+      check()
+      for (let i = 0; i < missing.length; i++) {
+        check()
+        const item = missing[i]
+        await cache.set({ key: item.key, translation: translations[i], timestamp: Date.now(), provider })
+        results.push({ id: item.id, translation: translations[i], provider })
+      }
+    }
+    check()
+    return { results }
+  } finally { active.delete(controller) }
+}
+export async function handleMessage(message: unknown, sender: chrome.runtime.MessageSender): Promise<unknown> {
+  if (!isRecord(message) || typeof message.type !== 'string') throw new AppError('要求の形式が不正です。')
+  authorize(message, sender)
+  await ready
   switch (message.type) {
-    case 'TRANSLATE_SINGLE': {
-      const { targetLang } = await getStoredKeys()
-      const { translatable, restore } = tokenize(message.text)
-      const cacheKey = await buildCacheKey(translatable, targetLang, 'any')
-
-      const cached = await cache.get(cacheKey)
-      if (cached) {
-        return { translation: restore(cached.translation), provider: cached.provider }
-      }
-
-      const { translations, provider } = await translateTexts([translatable])
-      const raw = translations[0] ?? ''
-      const translation = restore(raw)
-
-      await cache.set({ key: cacheKey, translation: raw, timestamp: Date.now(), provider })
-
-      return { translation, provider }
+    case 'TRANSLATE_BATCH': return translate(message.items as BatchItem[])
+    case 'GET_USAGE': return getUsageStats()
+    case 'GET_CONFIG': {
+      const settings = readSettings(await chrome.storage.sync.get(['enabled', 'targetLang', 'preferredProvider']))
+      const keys = await chrome.storage.local.get(['deeplKey', 'googleKey'])
+      return { ...settings, deeplKey: keys.deeplKey === undefined ? '' : validKey(keys.deeplKey),
+        googleKey: keys.googleKey === undefined ? '' : validKey(keys.googleKey) }
     }
-
-    case 'TRANSLATE_BATCH': {
-      const { targetLang } = await getStoredKeys()
-      const results: TranslationResponseItem[] = []
-      const toTranslate: Array<{ id: string; translatable: string; restore: (s: string) => string }> = []
-
-      for (const item of message.items) {
-        const { translatable, restore } = tokenize(item.text)
-        const cacheKey = await buildCacheKey(translatable, targetLang, 'any')
-        const cached = await cache.get(cacheKey)
-
-        if (cached) {
-          results.push({
-            id: item.id,
-            translation: restore(cached.translation),
-            provider: cached.provider as ProviderName,
-          })
-        } else {
-          toTranslate.push({ id: item.id, translatable, restore })
-        }
-      }
-
-      if (toTranslate.length > 0) {
-        const { translations, provider } = await translateTexts(
-          toTranslate.map((t) => t.translatable),
-        )
-
-        for (let i = 0; i < toTranslate.length; i++) {
-          const item = toTranslate[i]
-          const raw = translations[i] ?? ''
-          const translation = item.restore(raw)
-          const cacheKey = await buildCacheKey(item.translatable, targetLang, 'any')
-          await cache.set({ key: cacheKey, translation: raw, timestamp: Date.now(), provider })
-          results.push({ id: item.id, translation, provider })
-        }
-      }
-
-      return { results }
+    case 'SAVE_SETTINGS': {
+      if (!isRecord(message.settings)) throw new AppError('設定の形式が不正です。')
+      const settings = readSettings(message.settings)
+      const deeplKey = validKey(message.deeplKey)
+      const googleKey = validKey(message.googleKey)
+      invalidate()
+      await chrome.storage.local.set({ deeplKey, googleKey })
+      await chrome.storage.sync.set({ targetLang: settings.targetLang, preferredProvider: settings.preferredProvider,
+        settingsRevision: crypto.randomUUID() })
+      return { saved: true }
     }
-
-    case 'GET_USAGE': {
-      const stats = await getUsageStats()
-      return { deepl: stats.deepl, google: stats.google }
-    }
-
-    case 'SET_API_KEY': {
-      return new Promise<void>((resolve) => {
-        const storageKey = `${message.provider}Key`
-        const trimmedKey = message.key.trim()
-        if (trimmedKey) {
-          chrome.storage.local.set({ [storageKey]: trimmedKey }, resolve)
-        } else {
-          chrome.storage.local.remove(storageKey, resolve)
-        }
-      })
-    }
-
-    case 'GET_API_KEY': {
-      return new Promise((resolve) => {
-        chrome.storage.local.get([`${message.provider}Key`], (result) => {
-          resolve({ key: (result[`${message.provider}Key`] as string | undefined) ?? null })
-        })
-      })
-    }
-
-    case 'CLEAR_CACHE': {
-      await cache.clear()
+    case 'TEST_API': {
+      if (!isProvider(message.provider)) throw new AppError('翻訳先が不正です。')
+      const key = validKey(message.key)
+      await routeTranslation(['Hello'], 'JA', message.provider,
+        message.provider === 'deepl' ? key : null, message.provider === 'google' ? key : null)
+      await trackUsage(message.provider, 5)
       return { success: true }
     }
-
-    default:
-      return { error: 'Unknown message type' }
+    case 'CLEAR_CACHE':
+      invalidate()
+      await cache.clear()
+      await chrome.storage.sync.set({ cacheRevision: crypto.randomUUID() })
+      return { success: true }
+    default: throw new AppError('対応していない要求です。')
   }
 }
+chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+  void handleMessage(message, sender).then(
+    data => sendResponse({ ok: true, data }),
+    error => sendResponse({ ok: false, error: errorMessage(error) }),
+  )
+  return true
+})

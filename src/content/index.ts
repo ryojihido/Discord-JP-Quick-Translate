@@ -1,41 +1,39 @@
 import { MessageObserver } from './observer/messageObserver'
 import { ChannelObserver } from './observer/channelObserver'
 import { TranslationQueue } from './queue/translationQueue'
-import { MessageRegistry } from './state/messageRegistry'
 import { TranslationRenderer } from './renderer/translationRenderer'
-
-const queue = new TranslationQueue()
-const registry = new MessageRegistry()
-const renderer = new TranslationRenderer(queue, registry)
-
-const messageObserver = new MessageObserver((messageEl) => {
-  renderer.injectButton(messageEl)
-})
-
-const channelObserver = new ChannelObserver((_newPath) => {
-  registry.clear()
+import { readSettings } from '../shared/protocol'
+const renderer = new TranslationRenderer(new TranslationQueue())
+const messages = new MessageObserver(el => renderer.injectButton(el))
+let enabled = false
+const channels = new ChannelObserver(() => {
+  messages.stop()
   renderer.cleanup()
-  messageObserver.stop()
-  messageObserver.start()
+  if (enabled) messages.start()
 })
-
-chrome.storage.sync.get(['enabled'], (result) => {
-  const isEnabled = result.enabled !== false
-
-  if (isEnabled) {
-    messageObserver.start()
-    channelObserver.start()
+function apply(value: Record<string, unknown>): void {
+  messages.stop()
+  channels.stop()
+  renderer.cleanup()
+  enabled = readSettings(value).enabled
+  if (enabled) { messages.start(); channels.start() }
+}
+let revision = 0
+async function refresh(): Promise<void> {
+  const current = ++revision
+  try {
+    const value = await chrome.storage.sync.get(['enabled', 'targetLang', 'preferredProvider'])
+    if (revision === current) apply(value)
+  } catch {
+    if (revision !== current) return
+    enabled = false
+    messages.stop()
+    channels.stop()
+    renderer.cleanup()
+    console.error('[DJT] Settings could not be read. Translation is disabled.')
   }
+}
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'sync' && ['enabled', 'targetLang', 'preferredProvider', 'cacheRevision', 'settingsRevision'].some(k => k in changes)) void refresh()
 })
-
-chrome.runtime.onMessage.addListener((message) => {
-  if (message.type === 'TOGGLE_EXTENSION') {
-    if (message.enabled) {
-      messageObserver.start()
-      channelObserver.start()
-    } else {
-      messageObserver.stop()
-      renderer.cleanup()
-    }
-  }
-})
+void refresh()

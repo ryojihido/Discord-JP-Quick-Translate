@@ -1,5 +1,6 @@
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
+import { sendRequest, errorMessage } from '../shared/protocol'
 
 type ProviderName = 'deepl' | 'google'
 type Status = 'idle' | 'testing' | 'success' | 'error'
@@ -63,87 +64,61 @@ function OptionsApp() {
   const [preferredProvider, setPreferredProvider] = useState<ProviderName>('deepl')
   const [cacheCount, setCacheCount] = useState<number | null>(null)
   const [saved, setSaved] = useState(false)
+  const [ready, setReady] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
 
   const [deeplStatus, setDeeplStatus] = useState<Status>('idle')
   const [deeplStatusMsg, setDeeplStatusMsg] = useState('')
   const [googleStatus, setGoogleStatus] = useState<Status>('idle')
   const [googleStatusMsg, setGoogleStatusMsg] = useState('')
 
+
   useEffect(() => {
-    chrome.storage.sync.get(['targetLang', 'preferredProvider'], (result) => {
-      if (result.targetLang) setTargetLang(result.targetLang as string)
-      if (result.preferredProvider) setPreferredProvider(result.preferredProvider as ProviderName)
-    })
-
-    chrome.runtime.sendMessage({ type: 'GET_API_KEY', provider: 'deepl' }, (r: { key: string | null }) => {
-      if (r?.key) setDeeplKey(r.key)
-    })
-
-    chrome.runtime.sendMessage({ type: 'GET_API_KEY', provider: 'google' }, (r: { key: string | null }) => {
-      if (r?.key) setGoogleKey(r.key)
-    })
+    void sendRequest<{ targetLang: string; preferredProvider: ProviderName; deeplKey: string; googleKey: string }>({ type: 'GET_CONFIG' })
+      .then(config => {
+        setTargetLang(config.targetLang)
+        setPreferredProvider(config.preferredProvider)
+        setDeeplKey(config.deeplKey)
+        setGoogleKey(config.googleKey)
+        setReady(true)
+      }).catch(e => setError(errorMessage(e)))
   }, [])
 
-  function handleSave() {
-    chrome.storage.sync.set({ targetLang, preferredProvider })
-    chrome.runtime.sendMessage({ type: 'SET_API_KEY', provider: 'deepl', key: deeplKey })
-    chrome.runtime.sendMessage({ type: 'SET_API_KEY', provider: 'google', key: googleKey })
-    setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
+  async function handleSave() {
+    setBusy(true)
+    setSaved(false)
+    setError('')
+    try {
+      await sendRequest({ type: 'SAVE_SETTINGS', settings: { targetLang, preferredProvider }, deeplKey, googleKey })
+      setSaved(true)
+    } catch (e) { setError(errorMessage(e)) }
+    finally { setBusy(false) }
   }
 
-  async function testDeepL() {
-    setDeeplStatus('testing')
-    setDeeplStatusMsg('')
+  async function testApi(provider: ProviderName) {
+    const setStatus = provider === 'deepl' ? setDeeplStatus : setGoogleStatus
+    const setMessage = provider === 'deepl' ? setDeeplStatusMsg : setGoogleStatusMsg
+    setStatus('testing')
+    setMessage('')
     try {
-      const response = await fetch('https://api-free.deepl.com/v2/translate', {
-        method: 'POST',
-        headers: {
-          Authorization: `DeepL-Auth-Key ${deeplKey}`,
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: 'text=Hello&target_lang=JA',
-      })
-      if (response.ok) {
-        setDeeplStatus('success')
-        setDeeplStatusMsg('接続成功!')
-      } else {
-        setDeeplStatus('error')
-        setDeeplStatusMsg(`エラー: ${response.status}`)
-      }
-    } catch {
-      setDeeplStatus('error')
-      setDeeplStatusMsg('接続失敗')
+      await sendRequest({ type: 'TEST_API', provider, key: provider === 'deepl' ? deeplKey : googleKey })
+      setStatus('success')
+      setMessage('接続成功（Hello の翻訳で API を使用しました）')
+    } catch (e) {
+      setStatus('error')
+      setMessage(errorMessage(e))
     }
   }
 
-  async function testGoogle() {
-    setGoogleStatus('testing')
-    setGoogleStatusMsg('')
+  async function handleClearCache() {
+    setBusy(true)
+    setError('')
     try {
-      const url = `https://translation.googleapis.com/language/translate/v2?key=${encodeURIComponent(googleKey)}`
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: 'Hello', target: 'ja', format: 'text' }),
-      })
-      if (response.ok) {
-        setGoogleStatus('success')
-        setGoogleStatusMsg('接続成功!')
-      } else {
-        setGoogleStatus('error')
-        setGoogleStatusMsg(`エラー: ${response.status}`)
-      }
-    } catch {
-      setGoogleStatus('error')
-      setGoogleStatusMsg('接続失敗')
-    }
-  }
-
-  function handleClearCache() {
-    chrome.runtime.sendMessage({ type: 'CLEAR_CACHE' }, () => {
+      await sendRequest({ type: 'CLEAR_CACHE' })
       setCacheCount(0)
-    })
+    } catch (e) { setError(errorMessage(e)) }
+    finally { setBusy(false) }
   }
 
   return (
@@ -158,16 +133,16 @@ function OptionsApp() {
             provider="deepl"
             value={deeplKey}
             onChange={setDeeplKey}
-            onTest={testDeepL}
+            onTest={() => void testApi('deepl')}
             status={deeplStatus}
             statusMessage={deeplStatusMsg}
           />
           <ApiKeyField
-            label="Google Translate API キー（フォールバック）"
+            label="Google Translate API キー"
             provider="google"
             value={googleKey}
             onChange={setGoogleKey}
-            onTest={testGoogle}
+            onTest={() => void testApi('google')}
             status={googleStatus}
             statusMessage={googleStatusMsg}
           />
@@ -175,6 +150,7 @@ function OptionsApp() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>翻訳設定</h2>
+          <p style={styles.label}>選択したサービスだけを使用します。上限到達時の自動切替はしません。</p>
 
           <div style={styles.field}>
             <label style={styles.label}>翻訳先言語</label>
@@ -193,7 +169,7 @@ function OptionsApp() {
           </div>
 
           <div style={styles.field}>
-            <label style={styles.label}>優先プロバイダー</label>
+            <label style={styles.label}>使用する翻訳サービス</label>
             <div style={styles.radioGroup}>
               {(['deepl', 'google'] as ProviderName[]).map((p) => (
                 <label key={p} style={styles.radioLabel}>
@@ -205,7 +181,7 @@ function OptionsApp() {
                     onChange={() => setPreferredProvider(p)}
                     style={{ marginRight: 6 }}
                   />
-                  {p === 'deepl' ? 'DeepL 優先' : 'Google 優先'}
+                  {p === 'deepl' ? 'DeepL' : 'Google'}
                 </label>
               ))}
             </div>
@@ -214,19 +190,21 @@ function OptionsApp() {
 
         <section style={styles.section}>
           <h2 style={styles.sectionTitle}>キャッシュ</h2>
+          <p style={styles.label}>30 日経過した翻訳は起動時・次の翻訳時に削除します。クリアすると、開いている Discord の翻訳表示も消えます。</p>
           <div style={styles.cacheRow}>
             <span style={styles.label}>
               {cacheCount !== null ? `${cacheCount.toLocaleString()} 件のキャッシュ` : 'キャッシュ管理'}
             </span>
-            <button style={styles.dangerBtn} onClick={handleClearCache}>
+            <button style={styles.dangerBtn} onClick={handleClearCache} disabled={!ready || busy}>
               キャッシュをクリア
             </button>
           </div>
         </section>
 
+        <p role="alert" style={{ color: "#ed4245" }}>{error}</p>
         <div style={styles.footer}>
-          <button style={styles.saveBtn} onClick={handleSave}>
-            {saved ? '保存しました ✓' : '設定を保存'}
+          <button style={styles.saveBtn} onClick={handleSave} disabled={!ready || busy}>
+            {busy ? '処理中...' : saved ? '保存しました ✓' : '設定を保存'}
           </button>
         </div>
       </div>

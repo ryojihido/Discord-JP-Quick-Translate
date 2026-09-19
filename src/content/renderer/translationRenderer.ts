@@ -1,172 +1,75 @@
-import { extractMessageText } from '../extractor/messageExtractor'
-import { getMessageId } from '../observer/domSelectors'
+import { extractMessageParts, extractMessageText } from '../extractor/messageExtractor'
+import { tokenize } from '../extractor/tokenizer'
 import { TranslationQueue } from '../queue/translationQueue'
-import { MessageRegistry } from '../state/messageRegistry'
-
-const DJT_BTN_ATTR = 'data-djt-btn'
-const DJT_BLOCK_ATTR = 'data-djt-block'
-const DJT_HASH_ATTR = 'data-djt-hash'
-
-async function hashText(text: string): Promise<string> {
-  const encoded = new TextEncoder().encode(text)
-  const buffer = await crypto.subtle.digest('SHA-256', encoded)
-  return Array.from(new Uint8Array(buffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-function isInViewport(el: Element): boolean {
-  const rect = el.getBoundingClientRect()
-  return rect.top >= 0 && rect.bottom <= window.innerHeight
-}
-
-function createButton(): HTMLButtonElement {
-  const btn = document.createElement('button')
-  btn.className = 'djt-translate-btn'
-  btn.textContent = '🌐 翻訳'
-  btn.setAttribute(DJT_BTN_ATTR, 'true')
-  return btn
-}
-
-function createLoadingBlock(): HTMLDivElement {
-  const block = document.createElement('div')
-  block.className = 'djt-translation-block'
-  block.setAttribute(DJT_BLOCK_ATTR, 'true')
-  block.innerHTML = `
-    <div class="djt-loading">
-      <div class="djt-spinner"></div>
-      <span>翻訳中...</span>
-    </div>
-  `
-  return block
-}
-
-function createResultBlock(translation: string, provider: string): HTMLDivElement {
-  const block = document.createElement('div')
-  block.className = 'djt-translation-block'
-  block.setAttribute(DJT_BLOCK_ATTR, 'true')
-
-  const providerClass = provider.toLowerCase().includes('deepl') ? 'djt-deepl' : 'djt-google'
-  const providerLabel = provider.toLowerCase().includes('deepl') ? 'DeepL' : 'Google'
-
-  block.innerHTML = `
-    <span class="djt-translation-text">${escapeHtml(translation)}</span>
-    <span class="djt-provider-badge ${providerClass}">${providerLabel}</span>
-  `
-  return block
-}
-
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;')
-}
-
-function removeExistingBlock(messageEl: Element): void {
-  messageEl.querySelector(`[${DJT_BLOCK_ATTR}]`)?.remove()
-}
-
+import { AppError, errorMessage, MAX_TEXT_LENGTH } from '../../shared/protocol'
+const BTN = 'data-djt-btn'
+const BLOCK = 'data-djt-block'
 export class TranslationRenderer {
-  private readonly queue: TranslationQueue
-  private readonly registry: MessageRegistry
-
-  constructor(queue: TranslationQueue, registry: MessageRegistry) {
-    this.queue = queue
-    this.registry = registry
-  }
-
-  injectButton(messageEl: Element): void {
-    if (messageEl.querySelector(`[${DJT_BTN_ATTR}]`)) return
-
-    const text = extractMessageText(messageEl)
-    if (!text) return
-
-    const btn = createButton()
-
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      this.handleButtonClick(messageEl, btn, text)
+  private generation = 0
+  constructor(private readonly queue: TranslationQueue) {}
+  injectButton(message: Element): void {
+    if (message.querySelector('[' + BTN + ']') || !extractMessageText(message)) return
+    const button = document.createElement('button')
+    button.className = 'djt-translate-btn'
+    button.textContent = '🌐 翻訳'
+    button.setAttribute(BTN, 'true')
+    button.addEventListener('click', event => {
+      event.stopPropagation()
+      if (event.isTrusted) void this.handleButtonClick(message, button)
     })
-
-    messageEl.appendChild(btn)
+    message.appendChild(button)
   }
-
-  private async handleButtonClick(
-    messageEl: Element,
-    btn: HTMLButtonElement,
-    text: string,
-  ): Promise<void> {
-    const existingBlock = messageEl.querySelector(`[${DJT_BLOCK_ATTR}]`)
-
-    if (existingBlock) {
-      const isHidden = (existingBlock as HTMLElement).style.display === 'none'
-      ;(existingBlock as HTMLElement).style.display = isHidden ? '' : 'none'
-      btn.textContent = isHidden ? '✓ 非表示' : '🌐 翻訳'
+  private async handleButtonClick(message: Element, button: HTMLButtonElement): Promise<void> {
+    if (button.disabled) return
+    const parts = extractMessageParts(message)
+    const original = JSON.stringify(parts)
+    const existing = message.querySelector<HTMLElement>('[' + BLOCK + ']')
+    if (existing?.dataset.source === original && existing.dataset.success === 'true') {
+      existing.hidden = !existing.hidden
+      button.textContent = existing.hidden ? '🌐 翻訳' : '✓ 非表示'
       return
     }
-
-    const hash = await hashText(text)
-    const messageId = getMessageId(messageEl) ?? hash
-
-    const cached = this.registry.getByHash(hash)
-    if (cached) {
-      const block = createResultBlock(cached.translation, cached.provider)
-      messageEl.appendChild(block)
-      btn.textContent = '✓ 非表示'
-      btn.classList.add('djt-translated')
-      return
-    }
-
-    const loadingBlock = createLoadingBlock()
-    messageEl.appendChild(loadingBlock)
-    btn.disabled = true
-
+    existing?.remove()
+    const generation = this.generation
+    const valid = () => generation === this.generation && button.isConnected &&
+      JSON.stringify(extractMessageParts(message)) === original
+    button.disabled = true
+    const block = document.createElement('div')
+    block.className = 'djt-translation-block'
+    block.setAttribute(BLOCK, 'true')
+    block.textContent = '翻訳中...'
+    message.appendChild(block)
     try {
-      const { translation, provider } = await this.requestTranslation(
-        messageId,
-        text,
-        isInViewport(messageEl),
-      )
-
-      removeExistingBlock(messageEl)
-
-      const entry = { translation, provider, timestamp: Date.now() }
-      this.registry.set(messageId, hash, entry)
-
-      const resultBlock = createResultBlock(translation, entry.provider)
-      messageEl.setAttribute(DJT_HASH_ATTR, hash)
-      messageEl.appendChild(resultBlock)
-
-      btn.textContent = '✓ 非表示'
-      btn.classList.add('djt-translated')
-    } catch (err) {
-      removeExistingBlock(messageEl)
-      const errorBlock = document.createElement('div')
-      errorBlock.className = 'djt-translation-block'
-      errorBlock.setAttribute(DJT_BLOCK_ATTR, 'true')
-      errorBlock.style.borderLeftColor = '#ed4245'
-      errorBlock.textContent = '翻訳に失敗しました。もう一度お試しください。'
-      messageEl.appendChild(errorBlock)
-    } finally {
-      btn.disabled = false
-    }
+      if (parts.reduce((n, p) => n + p.text.length, 0) > MAX_TEXT_LENGTH) throw new AppError('文章が長すぎます（上限 8,000 文字）。')
+      const tokens = tokenize(parts)
+      if (tokens.texts.length === 0) throw new AppError('翻訳する文章がありません。コードなどは送信しません。')
+      const requestId = crypto.randomUUID()
+      const rect = message.getBoundingClientRect()
+      const results = await Promise.all(tokens.texts.map((text, index) => new Promise<{ translation: string; provider: string }>((resolve, reject) => {
+        this.queue.enqueue({ id: requestId + '-' + index, text, isInViewport: rect.top >= 0 && rect.bottom <= window.innerHeight, resolve, reject })
+      })))
+      if (!valid()) { block.remove(); return }
+      block.textContent = ''
+      const text = document.createElement('span')
+      text.className = 'djt-translation-text'
+      text.textContent = tokens.restore(results.map(r => r.translation))
+      const badge = document.createElement('span')
+      badge.className = 'djt-provider-badge ' + (results[0].provider === 'deepl' ? 'djt-deepl' : 'djt-google')
+      badge.textContent = results[0].provider === 'deepl' ? 'DeepL' : 'Google'
+      block.append(text, badge)
+      block.dataset.source = original
+      block.dataset.success = 'true'
+      button.textContent = '✓ 非表示'
+    } catch (error) {
+      if (!valid()) { block.remove(); return }
+      block.textContent = errorMessage(error)
+      block.style.borderLeftColor = '#ed4245'
+      button.textContent = '再試行'
+    } finally { button.disabled = false }
   }
-
-  private requestTranslation(
-    id: string,
-    text: string,
-    inViewport: boolean,
-  ): Promise<{ translation: string; provider: string }> {
-    return new Promise((resolve, reject) => {
-      this.queue.enqueue({ id, text, isInViewport: inViewport, resolve, reject })
-    })
-  }
-
   cleanup(): void {
-    document.querySelectorAll(`[${DJT_BTN_ATTR}]`).forEach((el) => el.remove())
-    document.querySelectorAll(`[${DJT_BLOCK_ATTR}]`).forEach((el) => el.remove())
+    this.generation++
+    this.queue.cancel()
+    document.querySelectorAll('[' + BTN + '],[' + BLOCK + ']').forEach(el => el.remove())
   }
 }
